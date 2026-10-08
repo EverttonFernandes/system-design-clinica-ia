@@ -4,7 +4,7 @@ Como projetar um assistente que responde dúvidas sobre uma clínica, encontra p
 
 Este repositório explora essa pergunta por meio de um **SaaS multi-tenant para clínicas**, com atendimento por Web e WhatsApp. O estudo conecta agentes, RAG, tools e backend transacional às decisões de qualidade, custo, latência e segurança que sustentam o sistema — do MVP à escala.
 
-O material nasceu de um desenho de entrevista de System Design e foi desenvolvido em **nove pranchas editáveis no draw.io**, acompanhadas de explicações, exemplos e cenários de falha. O conteúdo publicado é um estudo de arquitetura; os serviços descritos representam uma proposta, sem implementação executável ou resultados de produção neste repositório.
+O material nasceu de um desenho de entrevista de System Design e foi desenvolvido em **nove pranchas editáveis no draw.io**, acompanhadas de explicações, exemplos e cenários de falha. A arquitetura V2 mantém os fluxos da V1 e explicita os controles necessários para produção: Redis, AI Gateway, tools restritas, ingestão segura e operações transacionais recuperáveis. O conteúdo publicado é um estudo de arquitetura; os serviços descritos representam uma proposta, sem implementação executável ou resultados de produção neste repositório.
 
 **Comece pelo [fluxo de atendimento](#atendimento), acompanhe a [busca de conhecimento](#rag) e termine na [reserva de uma consulta](#agendamento).** Para editar as nove pranchas, use o [arquivo fonte do draw.io][drawio].
 
@@ -49,7 +49,7 @@ Neste cenário, cada clínica é um tenant independente. `tenantId` identifica a
 
 O assistente tem escopo administrativo e informativo. A indicação de profissionais considera catálogo e preferências; diagnóstico e decisões clínicas não fazem parte do fluxo proposto.
 
-**Premissas ainda abertas:** quantidade de clínicas e usuários, pico de mensagens, volume documental, frequência de atualização, orçamento, disponibilidade desejada e tempo aceitável de resposta. O desenho não presume metas numéricas nem uma stack obrigatória. Essas informações orientam o dimensionamento e as escolhas de implementação.
+**Premissas ainda abertas:** quantidade de clínicas e usuários, pico de mensagens, volume documental, frequência de atualização, orçamento, disponibilidade desejada e tempo aceitável de resposta. A V2 define PostgreSQL como fonte transacional, pgvector para RAG e Redis para sessão, cache e limites. Não presume metas numéricas, broker específico nem um deployment por caixa. As informações de carga orientam o dimensionamento e as escolhas ainda abertas.
 
 <a id="atendimento"></a>
 
@@ -63,12 +63,12 @@ Considere a mensagem: **“A clínica atende aos sábados? Quero marcar com um d
 
 1. **O canal entrega a mensagem.** A Web envia uma requisição; o WhatsApp entrega um evento por webhook validado.
 2. **O gateway estabelece o contexto.** Resolve clínica, identidade e permissões aplicáveis, aplica limites e inicia a correlação da requisição.
-3. **O Agent Service carrega o estado.** Recupera a conversa autorizada, prepara o contexto e chama o modelo selecionado.
+3. **O Conversation Service consulta sessão e cache no Redis.** Um hit elegível e autorizado responde sem Agent, RAG ou LLM. No miss, prepara o contexto para o Agent Runtime.
 4. **O modelo propõe uma resposta ou uma tool.** A aplicação valida a proposta antes de executar a capacidade solicitada.
-5. **As fontes adequadas respondem.** `searchClinicKnowledge` busca informações documentais; `findProfessionals` consulta o catálogo; `getAvailableSlots` consulta a agenda.
+5. **As fontes adequadas respondem.** As tools passam pelo API Gateway até os serviços determinísticos: `searchClinicKnowledge` busca informações documentais; `findProfessionals` consulta o catálogo; `getAvailableSlots` consulta a agenda. Chamadas de modelo seguem Agent → AI Gateway → Model Router → provider.
 6. **A aplicação compõe a resposta e salva o estado.** Uma reserva exige a escolha do paciente e a execução do [fluxo de agendamento](#agendamento).
 
-As chamadas às tools podem exigir novas interações com o modelo. Por isso, o orçamento de tempo e tokens deve abranger toda a tarefa, incluindo essas etapas.
+As chamadas às tools podem exigir novas interações com o modelo. Por isso, o orçamento de tempo, tokens e custo abrange toda a tarefa, incluindo embeddings, retries e fallback. Os [limites determinísticos](#custos) são verificados antes das operações caras.
 
 <a id="guia-atendimento"></a>
 
@@ -84,17 +84,19 @@ As chamadas às tools podem exigir novas interações com o modelo. Por isso, o 
 | Marcador | Componente | Responsabilidade | Por que ele existe |
 | --- | --- | --- | --- |
 | R1 | API Gateway / BFF | Validar entrada, autenticar conforme a operação, resolver tenant, aplicar limites e propagar `traceId`. | Estabelecer um contexto confiável antes da execução. |
-| R2 | Clinic Assistant / Agent Service | Coordenar modelo, prompt, tools, estado e limites de execução. | Transformar a conversa em um fluxo controlado pela aplicação. |
-| R3 | RAG Service | Recuperar conhecimento com filtros obrigatórios e devolver fontes. | Responder com informações da clínica autorizada. |
-| R4 | API de domínio | Aplicar regras de catálogo e agendamento, incluindo transações. | Preservar as regras de negócio independentemente da saída do modelo. |
-| R5 | Session / State Store | Persistir contexto e progresso do workflow. | Permitir continuidade da conversa e execução em múltiplas instâncias. |
-| R6 | Model Router | Selecionar uma configuração de modelo por capacidade e orçamento. | Ajustar a execução aos requisitos da tarefa. |
+| R2 | Conversation + Agent Runtime | Consultar cache antes do agente; coordenar modelo, prompt, tools e limites cumulativos. | Transformar a conversa em um fluxo controlado pela aplicação. |
+| R3 | Knowledge Service / RAG | Autorizar a recuperação, limitar Top-K e devolver fontes do PostgreSQL + pgvector. | Responder com informações da clínica autorizada. |
+| R4 | Serviços de domínio | Validar paciente e recurso; aplicar regras de catálogo, pacientes e agenda, incluindo transações. | Preservar as regras de negócio independentemente da saída do modelo. |
+| R5 | Redis | Separar sessão, cache e consumo; coordenar quotas e reservas de budget entre instâncias. | Compartilhar estado temporário e impedir consumo descontrolado. |
+| R6 | AI Gateway → Model Router | Governar providers, credenciais, rotas, orçamento, accounting e resiliência. | Controlar cada chamada de modelo dentro dos limites da tarefa. |
 
 <a id="entrada-confiavel"></a>
 
 **R1 · Entrada e canais.** O tenant vem de identidade e configuração validadas, como a associação do canal à clínica. Um `tenantId` enviado pelo cliente ou sugerido pela LLM precisa ser confrontado com esse contexto. Validar a origem de um webhook também não dispensa a autorização do paciente para a ação pedida.
 
-Na Web, SSE pode entregar trechos da resposta conforme são produzidos. Isso melhora a percepção de espera; não elimina o tempo total de processamento. No WhatsApp, recebimento do webhook e envio da resposta são etapas separadas. Eventos repetidos precisam ser reconhecidos para evitar a repetição do atendimento. WebSocket fica como opção quando houver necessidade de comunicação bidirecional persistente.
+Na Web, SSE pode entregar trechos da resposta conforme são produzidos. Isso melhora a percepção de espera; não elimina o tempo total de processamento. No WhatsApp, o caminho é Provider → Webhook → API Gateway → Conversation Service. O webhook valida origem/assinatura e resolve tenant/usuário; persiste evento e deduplicação duráveis atomicamente antes do ACK. A resposta rápida ao provider confirma o recebimento, enquanto o processamento pesado segue pela fila recuperável e a resposta ao paciente é enviada depois. Se a persistência falhar, não confirmar o recebimento. WebSocket fica como opção quando houver necessidade de comunicação bidirecional persistente.
+
+O API Gateway aplica TLS, autenticação/autorização de entrada, rate limit, quotas, routing, logs, métricas e tracing. Os serviços revalidam autorização sobre paciente e recurso; regras complexas de agenda permanecem no domínio.
 
 **R2 · Orquestração.** O MVP usa um agente com ferramentas especializadas. A aplicação controla quais tools estão disponíveis, valida argumentos, limita iterações e decide quando encerrar. A LLM pode propor `createAppointment`, mas a criação depende das regras do backend e da intenção confirmada do paciente.
 
@@ -102,13 +104,22 @@ Na Web, SSE pode entregar trechos da resposta conforme são produzidos. Isso mel
 
 <a id="estado-cache"></a>
 
-**R5 · Estado e memória.** Histórico selecionado, preferências informadas, profissional escolhido e etapa atual são dados da aplicação. Uma chave conceitual pode ser `tenantId + clinicId + conversationId`, sempre com verificação do participante autorizado. Conhecer o identificador da conversa não deve conceder acesso a ela.
+**R5 · Redis: sessão, cache e consumo.** Todas as chaves abaixo recebem namespace de `tenantId + clinicId`, com identidade e autorização validadas pelo backend. Conhecer um identificador de sessão ou paciente não concede acesso.
 
-TTL e política de persistência variam conforme o dado. O contexto temporário pode expirar; o registro de uma reserva permanece no banco de domínio. Se a conversa for resumida, a aplicação deve preservar escolhas e fatos críticos e medir o efeito do resumo na qualidade.
+| Chave conceitual dentro do namespace | Conteúdo e responsabilidade | Expiração e acesso |
+| --- | --- | --- |
+| `session:{sessionId}` | Contexto recente, últimas mensagens, intenção e etapa da conversa. | TTL curto; somente participantes autorizados. |
+| `answer-cache:{patientId}:{questionHash}` | Resposta reutilizável pelo mesmo paciente. | TTL próprio; revalidar autorização em cada hit. |
+| `shared-answer-cache:{clinicId}:{questionHash}` | Resposta reutilizável entre usuários da clínica. | Somente conteúdo não pessoal, com contexto compatível. |
+| `usage:{patientId}` | Requests, LLM/RAG/tool calls, tokens de entrada/saída e custo estimado. | Janela de quota independente do TTL da sessão. |
 
-**Cache opcional.** Em cache-aside, a aplicação consulta o cache e, em uma ausência, busca a fonte e armazena o resultado. A chave precisa considerar tenant, clínica e, conforme o conteúdo, permissões, versão documental e identidade do usuário. TTL limita a duração; invalidação trata mudanças que precisam refletir antes do vencimento. Disponibilidade em cache continua sujeita à validação no momento da reserva.
+**Cache antes do Agent.** Conversation consulta o cache após os controles de entrada. A identidade da entrada também considera contexto, permissões e versão documental; o mesmo texto em conversas diferentes não garante uma resposta reutilizável. Um hit autorizado evita Agent/RAG/LLM e ainda conta como request. Um miss segue para o agente e armazena somente uma resposta elegível. Revogação de acesso e mudanças de dados exigem invalidação/versionamento, além do TTL. Agenda pode usar cache de TTL curto para leitura; a reserva sempre revalida no PostgreSQL.
 
-**R6 · Seleção de modelos.** O router pode começar como configuração interna, com um único provider validado. Selecionar outro modelo exige comparar sucesso da tarefa, uso de tools, custo e latência. Extrair um AI Gateway e adicionar providers faz parte da [evolução](#evolucao), quando houver uma necessidade operacional demonstrável.
+Sessão, respostas e uso têm responsabilidades e TTLs separados. Expirar a conversa não renova a quota de consumo. Redis mantém estado temporário e coordenação; reservas e registros financeiros recuperáveis permanecem no PostgreSQL. Se a conversa for resumida, preservar escolhas e fatos críticos e medir o efeito na qualidade.
+
+**R6 · AI Gateway e seleção de modelos.** O caminho lógico é Agent → AI Gateway → Model Router → provider. Essas responsabilidades existem na V2 e podem começar como módulos do mesmo processo, com um provider validado. O gateway controla credenciais, budget, tokens/custo, timeout, retry limitado, backoff/jitter, circuit breaker e observabilidade. O router escolhe rotas como `simple-extraction`, `general-chat`, `summarization`, `complex-reasoning` e `document-analysis`.
+
+Selecionar outro modelo ou fallback exige evals de qualidade, tools, custo e latência. Retry/fallback preservam o deadline e os limites cumulativos da tarefa, sem renovar orçamento nem repetir efeitos de domínio. Separar o gateway em um deployment próprio depende de necessidade operacional medida.
 
 **Pergunta de revisão:** se duas instâncias do agente receberem mensagens da mesma conversa, como preservar a ordem e evitar atualizações perdidas? Estado externo permite compartilhar dados, mas a implementação ainda precisa de uma estratégia de concorrência por sessão.
 
@@ -126,7 +137,7 @@ RAG significa *Retrieval-Augmented Generation*: a geração recebe contexto obti
 | --- | --- | --- |
 | Gatilho | Documento novo ou atualizado. | Pergunta que exige conhecimento documental. |
 | Entrada | Arquivo original e metadados autorizados. | Pergunta e contexto confiável da requisição. |
-| Transformação | Parsing → chunks → embeddings → indexação. | Embedding da pergunta → busca filtrada → contexto. |
+| Transformação | Validação de segurança → extração segura → chunks → embeddings → indexação. | Embedding da pergunta → busca autorizada e filtrada → Top-K → contexto. |
 | Comunicação | Processamento assíncrono por jobs. | Recuperação dentro do atendimento. |
 | Resultado | Versão documental completa disponível para busca. | Trechos relevantes e fontes para a resposta. |
 
@@ -145,19 +156,20 @@ RAG significa *Retrieval-Augmented Generation*: a geração recebe contexto obti
 
 <a id="isolamento-rag"></a>
 
-**I1 · Isolamento durante a recuperação.** O retriever impõe `tenantId`, `clinicId`, permissões, status e versão ativa na consulta. Documentos de outro tenant não podem entrar no conjunto devolvido à aplicação, ao cache de resultados ou ao contexto do modelo. Recuperar resultados globais e confiar na LLM para descartá-los quebra essa fronteira.
+**I1 · Isolamento durante a recuperação.** O Knowledge Service autoriza a requisição antes de gerar embeddings e impõe `tenantId`, `clinicId`, `visibility`, `documentType`, permissões, status e versão ativa na consulta, conforme o conteúdo. `patientId`, quando aplicável, vem da identidade/permissão validada. Documentos de outro tenant ou paciente não podem entrar no conjunto devolvido à aplicação, ao cache ou ao contexto do modelo. Recuperar resultados globais e confiar na LLM para descartá-los quebra essa fronteira.
 
-O contexto recuperado contém dados para análise. Uma frase em um documento pedindo para ignorar regras, acessar outra clínica ou executar uma tool continua sendo conteúdo não confiável. As permissões da execução permanecem sob controle do backend.
+O contexto recuperado é **DATA, nunca INSTRUCTION**. Uma frase em um documento pedindo para ignorar regras, acessar outra clínica ou executar uma tool continua sendo conteúdo não confiável. Não altera instruções nem concede capacidades. Mesmo com a LLM manipulada, autorização e tools restritas precisam impedir dano.
 
-**I2 · Fontes e metadados.** O Object Storage mantém o documento original; o índice vetorial guarda representações derivadas. Essa separação permite reindexar sem transformar o banco vetorial na única cópia do conhecimento.
+**I2 · Fontes e metadados.** O Object Storage mantém o documento original e sua versão; PostgreSQL + pgvector guarda chunks, embeddings e metadados derivados. Essa separação permite reconstruir o índice. Avaliar HNSW ou IVFFlat e índices tradicionais para os filtros de metadados com medições de qualidade e latência; não exigir todas as opções.
 
 | Campo do chunk | Função no estudo |
 | --- | --- |
 | `tenantId`, `clinicId` | Delimitar a origem e o escopo autorizado da busca. |
+| `patientId`, quando aplicável | Restringir conteúdo pessoal ao paciente/ator autorizado. |
 | `documentId`, `chunkId` | Rastrear o trecho e permitir escrita idempotente. |
 | `documentType` | Identificar a categoria da informação. |
 | `version`, `createdAt` | Identificar a revisão e seu histórico. |
-| `permissions`, `status` | Restringir acesso e elegibilidade para consulta, quando aplicável. |
+| `visibility`, `permissions`, `status` | Restringir acesso e elegibilidade para consulta, quando aplicável. |
 | Texto e referência à origem | Sustentar a resposta e permitir inspeção da fonte. |
 | Embedding | Representar o trecho no espaço vetorial usado pela busca. |
 
@@ -167,10 +179,10 @@ O modelo de embedding, sua versão e dimensão também precisam ser rastreados n
 
 **I3 · Ingestão e publicação.** O fluxo proposto é:
 
-1. Validar o upload e salvar o original com sua versão e origem.
-2. Registrar o processamento pendente e publicar um job com referência ao objeto.
-3. O worker extrai o texto, preserva sua estrutura e cria chunks rastreáveis.
-4. Gerar embeddings e gravar os chunks de forma idempotente.
+1. Autorizar o upload, limitar formato/tamanho e salvar o original em quarentena com sua versão e origem.
+2. Registrar o processamento pendente e publicar um job recuperável com referência ao objeto.
+3. O worker revalida origem/tenant, realiza malware scanning, extração segura e sanitização/classificação antes de criar chunks rastreáveis. Arquivo rejeitado não segue para embeddings; todo documento continua não confiável mesmo após validação.
+4. Limitar tamanho extraído, chunks, batch, tokens e custo do job. Reservar budget/quota/concurrency antes do provider de embeddings e gravar chunks idempotentemente, contabilizando também retries.
 5. Verificar que a nova versão está completa antes de torná-la consultável.
 6. Ativar a versão, retirar a anterior das novas consultas e invalidar caches afetados.
 
@@ -179,7 +191,7 @@ PENDING → PROCESSING → INDEXED
                     ↘ FAILED → PENDING, após reprocessamento controlado
 ```
 
-Uma chave conceitual para upsert é `tenantId + clinicId + documentId + version + chunkId`. Reexecutar o mesmo job não deve criar cópias adicionais dos mesmos chunks. Falhas transitórias recebem tentativas limitadas com espera; falhas persistentes seguem para uma DLQ, onde podem ser inspecionadas e reprocessadas.
+Uma chave conceitual para upsert é `tenantId + clinicId + documentId + version + chunkId`. Reexecutar o mesmo job não deve criar cópias adicionais dos mesmos chunks. Falhas transitórias recebem tentativas limitadas com backoff/jitter; ao esgotá-las, seguem para uma DLQ. Falhas permanentes de segurança ou conteúdo são rejeitadas, sem retry automático. Reprocessamento exige inspeção e controle.
 
 Publicar uma versão é uma decisão de consistência. Se 80 de 100 chunks foram gravados, a revisão permanece invisível. O sistema precisa de um mecanismo de ativação que permita consultar somente versões completas. A versão anterior pode continuar ativa enquanto a atualização é preparada, desde que permaneça autorizada e válida.
 
@@ -189,7 +201,7 @@ Salvar o objeto e publicar o job também são operações distintas. Um registro
 
 <a id="qualidade-rag"></a>
 
-**Como avaliar o resultado.** Top-K define quantos trechos retornam. Um K maior pode ampliar cobertura e também trazer ruído, consumir contexto e aumentar custo. Similaridade vetorial não representa probabilidade de a informação estar correta. Quando não houver evidência suficiente, o assistente deve explicar o limite ou encaminhar a dúvida.
+**Como avaliar o resultado.** Top-K define quantos trechos retornam e tem um teto determinado pelo backend, que a LLM não pode aumentar. Um K maior pode ampliar cobertura e também trazer ruído, consumir contexto e aumentar custo. Embeddings da pergunta também passam pelos controles de consumo antes do provider. Similaridade vetorial não representa probabilidade de a informação estar correta. Quando não houver evidência suficiente, o assistente deve explicar o limite ou encaminhar a dúvida.
 
 Na avaliação, separe duas perguntas: **o retriever encontrou a evidência certa?** E **o modelo respondeu de acordo com ela?** Essa separação ajuda a distinguir problemas de indexação, busca e geração.
 
@@ -221,9 +233,12 @@ O modelo ajuda a interpretar o pedido e explicar o resultado. As regras que impe
 | `searchClinicKnowledge` | RAG Service e índice vetorial. | Trechos relevantes e fontes. | Tenant, clínica, permissões e versões ativas. |
 | `findProfessionals` | Catálogo da clínica. | Profissionais compatíveis com os filtros. | Vínculo com a clínica e critérios autorizados. |
 | `getAvailableSlots` | Scheduling API. | Horários disponíveis no momento da consulta. | Profissional, clínica, período e regras de agenda. |
+| `getPatientData` | Patient Service. | Somente os campos pessoais permitidos para a finalidade. | Identidade, paciente/recurso autorizado e minimização. |
 | `createAppointment` | Scheduling API e banco transacional. | Reserva confirmada ou erro de domínio explícito. | Identidade, autorização, intenção, idempotência e concorrência. |
+| `cancelAppointment` | Scheduling API e banco transacional. | Cancelamento persistido ou erro de domínio. | Pertencimento da reserva, autorização e idempotência. |
+| `updateAppointment` | Scheduling API e banco transacional. | Alteração/reagendamento atômico ou conflito. | Autorização, idempotência e integridade do novo horário. |
 
-Uma tool é um adapter com contrato restrito: recebe argumentos definidos, chama uma capacidade e devolve um resultado estruturado. Ela pode invocar um módulo do monólito; uma API remota não é obrigatória para cada tool.
+Uma tool é um adapter com contrato restrito: recebe argumentos definidos, chama uma capacidade e devolve um resultado estruturado. O caminho é **Agent → Tool → API Gateway → serviço determinístico → datastore**. Somente o serviço acessa o banco; não oferecer `executeSQL`, `callAnyUrl`, `executeShell` ou HTTP genérico. Esses limites podem existir como módulos do monólito, preservando os controles do gateway sem exigir uma chamada remota por caixa.
 
 **Exemplo conceitual de argumentos propostos pelo modelo**, após a escolha do paciente:
 
@@ -244,7 +259,7 @@ Há dois momentos distintos: o paciente confirma o que deseja; o sistema confirm
 
 <a id="idempotencia"></a>
 
-**A2 · Repetir sem duplicar.** A aplicação cria uma chave por intenção de reserva e a preserva durante retries e retomadas. O escopo inclui tenant, clínica e operação. O serviço associa essa chave ao payload e ao resultado persistido.
+**A2 · Repetir sem duplicar.** Criar, cancelar e alterar usam uma chave por intenção, preservada durante retries e retomadas. O escopo inclui **tenant + clínica + ator + operação + chave**. O serviço associa essa chave ao hash do payload e ao resultado persistido. A reivindicação da chave, a mudança de domínio e o resultado são protegidos na mesma transação; chamadas simultâneas produzem um único efeito.
 
 | Situação | Comportamento esperado |
 | --- | --- |
@@ -262,7 +277,9 @@ O hash do payload ajuda a detectar divergência; ele não substitui a identidade
 
 Para uma agenda de slots exclusivos, uma restrição de unicidade pode proteger a combinação clínica, profissional e slot entre reservas ativas. Para consultas com duração variável, horários de início diferentes ainda podem se sobrepor. Nesse caso, é necessário controlar os intervalos. PostgreSQL, por exemplo, oferece constraints de exclusão que permitem expressar restrições desse tipo. Veja a [documentação de constraints](https://www.postgresql.org/docs/current/ddl-constraints.html).
 
-Uma transação, isoladamente, não torna seguro qualquer fluxo “consultar e depois inserir”. A estratégia precisa combinar a regra de integridade com escrita atômica, isolamento ou locks adequados. Cancelamento, capacidade maior que um e fuso horário também precisam estar definidos no modelo de agenda.
+Uma transação, isoladamente, não torna seguro qualquer fluxo “consultar e depois inserir”. A estratégia combina integridade com escrita atômica, isolamento ou locks adequados; `SELECT FOR UPDATE` serve quando existe uma linha de slot a bloquear, não protege uma linha ausente. Reagendar valida/reserva o novo horário e libera o antigo na mesma transação: um conflito preserva a reserva anterior. Cancelamento, capacidade maior que um e fuso horário também precisam estar definidos no modelo de agenda.
+
+Cache de agenda tem TTL curto e pode orientar a consulta. Criar, cancelar e reagendar invalidam/versionam as entradas relevantes depois do commit, com entrega recuperável. A confirmação revalida disponibilidade no PostgreSQL e exige consistência forte; cache, analytics e notificações podem ter consistência eventual.
 
 **Exemplo de corrida:** Ana e Bruno recebem a opção das 14h. Ana confirma primeiro e a reserva é persistida. A tentativa de Bruno encontra um conflito e recebe alternativas. A decisão vem do serviço transacional, mesmo que o modelo ainda tenha o horário antigo no contexto.
 
@@ -271,6 +288,8 @@ Uma transação, isoladamente, não torna seguro qualquer fluxo “consultar e d
 **A4 · Lidar com timeout e autorização.** Se a API gravou a reserva, mas a resposta se perdeu, um timeout não prova que a operação falhou. A aplicação consulta o resultado da intenção ou repete com a mesma chave. Até reconciliar o estado, informa que a confirmação está pendente.
 
 Cada tentativa revalida autorização e pertencimento de paciente, profissional e horário à clínica. Erros de permissão, payload ou horário ocupado exigem uma resposta de negócio; repetir a mesma operação automaticamente não corrige esses casos.
+
+Reserva/alteração, resultado idempotente e evento auditável durável são persistidos na transação. Depois do commit, os eventos alimentam auditoria, invalidação e notificações pela fila, com reconciliação de publicação e consumidores idempotentes. Uma falha no envio não desfaz a reserva nem exige criá-la novamente; o resultado ao paciente sempre deriva do estado persistido.
 
 <a id="aprovacao-humana"></a>
 
@@ -304,7 +323,9 @@ O isolamento precisa sobreviver a cada mudança de componente. A verificação c
 
 Prompt injection exige defesa em camadas: separar instruções e conteúdo externo, limitar capacidades e validar a execução. Um guardrail pode auxiliar, mas a autorização continua determinística. O [guia da OWASP sobre prompt injection](https://cheatsheetseries.owasp.org/cheatsheets/LLM_Prompt_Injection_Prevention_Cheat_Sheet.html) detalha validação de tools e aplicação de privilégio mínimo.
 
-O desenho inclui criptografia em trânsito e em repouso, gestão de segredos, minimização, retenção, exclusão e auditoria. Esses pontos orientam a implementação e a análise de privacidade; o diagrama, por si só, não demonstra conformidade com a LGPD. Prompts, documentos e dados pessoais não devem aparecer indiscriminadamente em logs, exemplos públicos ou datasets de avaliação.
+PostgreSQL mantém os dados oficiais: pacientes, consultas, agenda e, quando presentes no domínio, prontuário, alergias e pagamentos. **Hash não é reversível**; dados que precisam ser recuperados exigem criptografia em trânsito/em repouso, gestão de chaves com KMS, rotação e acesso pelo menor privilégio necessário. Credenciais dos providers ficam sob controle do backend/AI Gateway.
+
+Auditoria registra eventos relevantes com `actor`, `tenant`, `patient/resource`, `action`, `result`, `timestamp` e `correlationId`. Não exige armazenar conversas completas. Eventos de operações persistentes são recuperáveis mesmo quando a entrega assíncrona falha. Minimização, limitação de finalidade, retenção, exclusão e isolamento orientam a implementação e a análise de privacidade; o diagrama, por si só, não demonstra conformidade com a LGPD. Prompts, documentos e dados pessoais não devem aparecer indiscriminadamente em logs, exemplos públicos ou datasets de avaliação.
 
 <a id="observabilidade"></a>
 
@@ -319,6 +340,9 @@ Uma resposta errada pode decorrer de uma fonte obsoleta, um filtro incorreto, um
 | Modelo, versão de prompt e configuração do retriever | Mudanças de comportamento entre versões. |
 | Tool, resultado e número de passos | Ações incorretas, loops e falhas de domínio. |
 | Tokens de entrada/saída e custo | Consumo por requisição, tenant e tarefa concluída. |
+| Latência, erros, throughput e cache hit ratio | Saúde dos serviços e eficácia do caminho que evita chamadas de IA. |
+| LLM calls, RAG chunks/scores e retries/fallbacks | Recuperação, amplificação de chamadas e comportamento dos providers, sem registrar texto sensível. |
+| Resultados de evals por versão | Regressões de groundedness, hallucination, retrieval relevance, tools e trajetória. |
 | Idade da fila e status de ingestão | Atraso na publicação do conhecimento. |
 | Sucesso da tarefa e conflitos de reserva | Efeito percebido pelo paciente, além de respostas HTTP bem-sucedidas. |
 
@@ -328,7 +352,7 @@ Traces ajudam a investigar execuções; métricas mostram tendências; audit log
 
 ### Evals: medir qualidade antes de mudar o comportamento
 
-O pipeline proposto é **dataset → versão do agente → execução → métricas → decisão de liberação**. A versão avaliada inclui prompt, modelo, schemas das tools, configuração de retrieval e revisão do conteúdo ou índice.
+O pipeline proposto é **dataset → versão do agente → execução → métricas → decisão de liberação**. A versão avaliada inclui prompt, modelo, schemas das tools, configuração de retrieval e revisão do conteúdo ou índice. Usar dados sintéticos/anonimizados e casos representativos, adversariais e de isolamento. Cobrir seleção de tools, argumentos, groundedness, hallucination, retrieval relevance, trajetória, segurança, custo, latência e modelos de fallback.
 
 | Caso de estudo | Evidência esperada | Tipo de avaliação |
 | --- | --- | --- |
@@ -339,6 +363,12 @@ O pipeline proposto é **dataset → versão do agente → execução → métri
 | Acesso cruzado entre tenants | Negativa nas fronteiras de dados e execução. | Testes de autorização e isolamento. |
 | Repetição da criação de uma consulta | Um único efeito e resultado recuperável. | Testes de integração e idempotência. |
 | Duas reservas para um slot exclusivo | Apenas uma aceita; a outra recebe conflito. | Teste de concorrência. |
+| Reagendamento encontra conflito | Novo horário rejeitado e reserva anterior preservada. | Teste transacional de concorrência. |
+| Cache hit com contexto/permissões diferentes | Negativa ao conteúdo inadequado; hit elegível evita Agent/RAG/LLM. | Testes determinísticos de contexto e isolamento. |
+| Budget disputado entre instâncias, com embeddings e fallback | Consumo reservado atomicamente; limites totais não se renovam. | Testes de concorrência, custo e retries. |
+| Redis indisponível | Operações caras bloqueadas até recuperar quotas/budget. | Simulação de falha e verificação de chamadas ao provider. |
+| Falha depois do commit | Resultado idempotente recuperado; audit, cache e notificação reconciliados. | Testes de falha entre persistência e publicação. |
+| Trajetória com tools e argumentos inadequados | Backend rejeita a ação e a tarefa respeita limites de passos/custo/latência. | Assertions da execução + avaliação da trajetória. |
 | Alteração de modelo ou fallback | Comparação de qualidade, tools, custo e latência. | Regressão sobre o mesmo conjunto de casos. |
 
 LLM-as-a-Judge pode apoiar avaliações de relevância e aderência à evidência, com uma rubrica explícita e calibração humana. Regras como “não houve uma segunda reserva” são verificadas diretamente no estado do sistema. O juiz também pode errar e não substitui essas verificações.
@@ -363,7 +393,22 @@ Custo médio por tarefa bem-sucedida =
 
 Para avaliar o custo completo, acrescente infraestrutura, armazenamento, ingestão e operação com critérios de atribuição definidos. As expressões são um roteiro de medição; o repositório não pressupõe preços de fornecedores.
 
-Limites de passos, tokens, tempo total e consumo por tenant impedem execução sem controle. Reduzir contexto, resumir histórico, ajustar Top-K e usar cache podem economizar recursos; cada mudança deve passar pelas evals para detectar perda de qualidade.
+**Denial of Wallet** é o abuso que gera consumo e custo descontrolados, mesmo sem derrubar a aplicação. API Gateway e runtime aplicam rate limit, quotas e concurrency limit antes das operações caras. Redis coordena limites e reservas de budget atomicamente entre instâncias, por tenant/ator; para anônimos, considerar também origem/canal. A janela de quota independe da sessão, impedindo que uma nova conversa reinicie o limite.
+
+| Limite do Agent Runtime | O que protege |
+| --- | --- |
+| `maxSteps` | Número total de etapas da tarefa. |
+| `maxLLMCalls` | Chamadas de modelo, incluindo retries/fallbacks. |
+| `maxToolCalls` | Execuções de capacidades, incluindo repetições. |
+| `maxInputTokens` | Consumo de entrada acumulado. |
+| `maxOutputTokens` | Consumo de saída acumulado e teto da geração. |
+| `maxCost` | Orçamento cumulativo da tarefa. |
+| `timeout` | Deadline total, incluindo chamadas e esperas. |
+| `maxRetries` | Tentativas adicionais, coordenadas entre camadas. |
+
+Esses limites são definidos pelo backend e não podem ser aumentados pela LLM. Antes de cada LLM, embedding ou tool cara, verificar o saldo e reservar o custo estimado de entrada e saída máxima aplicável; reconciliar o consumo depois. Retries/fallbacks compartilham os mesmos limites. Timeout não prova ausência de cobrança: preservar a reserva enquanto o consumo estiver incerto. Os registros de uso financeiro precisam ser recuperáveis no PostgreSQL.
+
+**Redis indisponível:** bloquear operações caras até recuperar os controles, sem usar contadores locais que liberem quota por instância. Dados oficiais continuam no PostgreSQL. Reduzir contexto, resumir histórico, ajustar Top-K e usar cache podem economizar recursos; cada mudança passa pelas evals para detectar perda de qualidade.
 
 <a id="resiliencia"></a>
 
@@ -376,9 +421,13 @@ Limites de passos, tokens, tempo total e consumo por tenant impedem execução s
 | Retry com backoff e jitter | Recuperar falhas transitórias e distribuir novas tentativas. | Limitar tentativas e preservar idempotência em operações com efeitos. |
 | Circuit breaker | Interromper chamadas repetidas a uma dependência em falha. | Definir recuperação e comportamento alternativo. |
 | Fallback | Usar uma alternativa previamente validada. | Outro modelo pode mudar tool calling e qualidade das respostas. |
+| DLQ | Separar jobs que esgotaram tentativas para inspeção. | Reprocessar de forma controlada e idempotente. |
+| Bulkhead, quando necessário | Isolar capacidade entre dependências ou cargas. | Adotar conforme gargalo/risco observado, sem criar camadas antecipadamente. |
 | Degradação explícita | Informar limites e oferecer funções ainda disponíveis. | A resposta deve refletir o estado real da operação. |
 
-Evite retries independentes em muitas camadas: eles podem multiplicar a carga justamente quando uma dependência está degradada. Encerrar a espera por uma chamada também não garante que o serviço remoto deixou de executá-la.
+Evite retries independentes em muitas camadas: eles podem multiplicar a carga justamente quando uma dependência está degradada. Usar backoff exponencial com jitter e tentativas limitadas; writes só recebem retry quando idempotentes. Encerrar a espera por uma chamada também não garante que o serviço remoto deixou de executá-la. Fallback do AI Gateway continua dentro do budget/deadline e passa por evals.
+
+**Mensageria com responsabilidade definida.** Ingestão documental, embeddings em background, audit events, notificações, WhatsApp outbound e analytics podem usar processamento assíncrono. A consulta RAG mantém o embedding da pergunta dentro do atendimento. Publicação após commit é recuperável, com reconciliação; consumidores são idempotentes e falhas transitórias podem chegar à DLQ após esgotar retries. Escolher Kafka, RabbitMQ ou SQS conforme necessidade real, sem exigir os três nem um broker específico no MVP.
 
 <a id="capacidade"></a>
 
@@ -388,7 +437,9 @@ Antes de escolher quantidade de instâncias, defina o que será medido: latênci
 
 Para estudo, uma estimativa inicial de concorrência média é **taxa média de chegada × tempo médio no sistema**, usando a mesma janela e assumindo regime estável. Esse cálculo é um ponto de partida; dimensionar picos exige medições de carga e distribuição de latências.
 
-O agente pode escalar horizontalmente com estado externo, mas throughput também depende de quotas do provider, conexões e locks do banco, capacidade do índice e APIs externas. Workers de ingestão podem reagir à profundidade e idade da fila. Limites por tenant e backpressure ajudam a evitar que a carga de uma clínica comprometa as demais.
+O caminho de escala é **Load Balancer → N instâncias stateless de Webhook/Conversation/Agent/Scheduling/Knowledge**, com estado compartilhado em Redis/PostgreSQL/pgvector/Object Storage. Controles atômicos e ordem/checkpoints por sessão evitam que múltiplas instâncias renovem quotas ou percam atualizações. Concorrência com expiração precisa acompanhar o deadline das chamadas em execução.
+
+Throughput também depende de quotas do provider, pools de conexões, locks do banco, capacidade do índice e APIs externas. Autoscaling pode considerar CPU, memória, requests e latência; workers de ingestão, profundidade e idade da fila. Limites por tenant, pools ajustados à carga e backpressure ajudam a evitar que uma clínica comprometa as demais. Redis coordena estado temporário, sem substituir registros oficiais e dedupe durável.
 
 **Pergunta de revisão:** se o tempo do provider dominar a latência, o que acontece ao dobrar a quantidade de instâncias do agente mantendo a mesma quota externa?
 
@@ -408,16 +459,16 @@ O recorte inicial atende informações da clínica, busca de profissionais e age
 
 | Responsabilidade | Recorte inicial | Sinal para considerar evolução |
 | --- | --- | --- |
-| Canais | Web e/ou WhatsApp conforme o escopo de lançamento. | Necessidade comprovada de novos canais ou comunicação persistente. |
-| Orquestração | Um Clinic Assistant, tools restritas e limites de execução. | Evals mostram dificuldades que uma divisão de responsabilidades pode resolver. |
-| Modelos | Um provider validado e seleção por configuração. | Requisitos de disponibilidade, capacidade ou custo justificam outras opções. |
-| Domínio | Módulos de catálogo e agenda sobre banco transacional. | Carga, isolamento operacional ou autonomia de equipes justificam extração. |
-| Conhecimento | Documentos versionados, ingestão assíncrona e retrieval isolado. | Volume, distribuição da carga ou qualidade da busca exigem mudanças. |
-| Estado | Storage adequado à continuidade e recuperação da conversa. | Requisitos de throughput, persistência ou coordenação mudam. |
-| Cache | Adotar em consultas estáveis quando houver ganho medido. | Repetição e custo justificam ampliar a estratégia. |
-| Operação | Traces, evals, quotas, segurança e recuperação básica desde o início. | Metas de serviço exigem maior automação e capacidade. |
+| Canais | Web e WhatsApp, com webhook validado, dedupe durável e processamento recuperável. | Necessidade comprovada de novos canais ou comunicação persistente. |
+| Orquestração | Conversation + um Clinic Assistant, tools restritas e limites determinísticos. | Evals mostram dificuldades que uma divisão de responsabilidades pode resolver. |
+| Modelos | AI Gateway/Model Router lógicos, com provider validado, accounting e budget. | Carga ou disponibilidade justificam deployment separado e mais providers avaliados. |
+| Domínio | Serviços lógicos de catálogo, Patient e Scheduling via API Gateway; PostgreSQL transacional. | Carga, isolamento operacional ou autonomia de equipes justificam extração. |
+| Conhecimento | Ingestão segura, assíncrona e idempotente; PostgreSQL + pgvector autorizado. | Medições justificam índice HNSW/IVFFlat e escala independente. |
+| Estado e consumo | Redis com namespaces/TTLs separados, quotas e budget atômicos. | Requisitos de throughput, persistência ou coordenação mudam. |
+| Cache | Redis antes do Agent; respostas pessoais/compartilhadas elegíveis e autorizadas. | Repetição e custo justificam ampliar a estratégia sem perder frescor/isolamento. |
+| Operação | Audit durável, traces, evals, limites, segurança e recuperação desde o início. | Metas de serviço exigem maior automação e capacidade. |
 
-O Vector DB representa uma responsabilidade de busca e pode usar uma tecnologia adequada ao contexto, inclusive uma extensão de um banco já adotado. A escolha de produto depende das necessidades de busca, isolamento e operação; o desenho não exige um serviço separado por cilindro.
+Nesta V2, o Vector Store é PostgreSQL + pgvector. O cilindro do índice representa uma responsabilidade derivada, não exige um servidor separado do banco transacional. Separar infraestrutura ou serviços depende de carga e isolamento operacional; os controles definidos acima permanecem no MVP.
 
 ### O que muda ao adicionar componentes
 
@@ -430,10 +481,10 @@ O Vector DB representa uma responsabilidade de busca e pode usar uma tecnologia 
 | Ingestão assíncrona | Controle de carga e desacoplamento do upload. | Atraso de publicação e operação de jobs, retries e DLQ. | Tempo entre upload e versão disponível. |
 | Serviços separados | Escala e implantação independentes. | Chamadas remotas e consistência distribuída. | Gargalo ou necessidade organizacional identificável. |
 | Índices separados por tenant | Maior separação operacional. | Mais índices para criar, atualizar e monitorar. | Requisitos de isolamento, carga e custo de gestão. |
-| AI Gateway | Centralização de quotas, roteamento e políticas de providers. | Outra dependência operacional e possível gargalo. | Duplicação real dessas funções entre aplicações. |
+| AI Gateway em deployment separado | Escala e operação independentes das políticas de providers já presentes na V2. | Outra dependência operacional e possível gargalo. | Carga ou compartilhamento entre aplicações justifica extrair os módulos. |
 | Fallback de provider | Alternativa em falhas ou limitações de capacidade. | Diferenças de comportamento e novas integrações. | Evals e simulações demonstram recuperação aceitável. |
 
-**Frameworks no estudo.** LangChain aparece no desenho como possibilidade de apoio às integrações. LangGraph pode apoiar workflows com estado, persistência e intervenção humana, conforme sua [documentação de arquitetura](https://docs.langchain.com/oss/python/langgraph/overview). A escolha de framework não transfere para ele as regras de tenant, idempotência ou integridade da agenda.
+**Implementação simples.** A V2 define responsabilidades e controles, sem exigir um framework de agentes. Uma biblioteca futura não substitui autorização, idempotência, integridade da agenda ou limites de consumo. Começar como monólito modular preserva essas fronteiras sem exigir microserviços.
 
 <a id="falhas"></a>
 
@@ -444,6 +495,8 @@ Use esta tabela como roteiro de análise: encontre a dependência que falhou, de
 | Cenário | Resposta arquitetural esperada | Evidência para estudar ou testar |
 | --- | --- | --- |
 | Provider de LLM indisponível | Aplicar limites de espera e circuit breaker; usar fallback validado ou informar indisponibilidade. | Encerramento dentro do deadline e comportamento alternativo conhecido. |
+| PostgreSQL indisponível | Não confirmar reservas nem usar cache como registro oficial. | Nenhuma mensagem de sucesso sem resultado persistido. |
+| Redis indisponível | Bloquear operações caras até recuperar quota/budget compartilhados. | Nenhuma nova chamada cara liberada por contadores locais. |
 | Vector DB indisponível | Informar o limite da busca documental; manter funções de agenda que não dependam dela. | A falha de retrieval não bloqueia uma operação de domínio independente. |
 | RAG recupera trechos incorretos | Investigar fontes, filtros e ranking; reconhecer falta de evidência suficiente. | Dataset distingue erro de recuperação de erro de geração. |
 | Documento desatualizado | Reindexar, ativar a revisão correta e invalidar caches. | Novas consultas usam a versão elegível esperada. |
@@ -453,7 +506,9 @@ Use esta tabela como roteiro de análise: encontre a dependência que falhou, de
 | Tráfego aumenta dez vezes | Medir gargalos, aplicar backpressure e ajustar capacidade de toda a cadeia. | Carga controlada, filas observáveis e efeitos por tenant conhecidos. |
 | Uma clínica tenta acessar outra | Negar acesso em serviços, retrieval, state e cache. | Casos cruzados falham mesmo com IDs válidos de outro tenant. |
 | Documento contém prompt injection | Tratar a instrução como conteúdo externo e limitar execução por autorização. | Nenhuma ação indevida nem exposição de dados. |
-| Consumo de tokens cresce | Alertar, aplicar quotas e investigar contexto, passos e retries. | Custo explicado por tenant, versão e tipo de tarefa. |
+| Abuso/script gera consumo | Bloquear por rate limit, quota, concurrency e budget antes da IA. | Limites atômicos incluem embeddings e retries/fallbacks, mesmo entre instâncias. |
+| Reagendamento disputa o novo horário | Validar novo/liberar antigo na mesma transação. | Em conflito, reserva anterior preservada e nenhum horário duplicado. |
+| Falha na entrega após commit | Recuperar eventos de audit, invalidação e notificação sem repetir o efeito. | Resultado idempotente disponível e publicação reconciliada. |
 | Chamada de LLM ultrapassa o timeout | Encerrar a espera e impedir novas etapas além do deadline; reconciliar ações já iniciadas. | Ausência de execução descontrolada ou duplicação de efeitos. |
 | Ingestão falha pela metade | Manter a versão parcial invisível e retomar com escrita idempotente. | Busca retorna apenas versões completas e autorizadas. |
 
@@ -466,6 +521,15 @@ Uma estratégia de recuperação fica mais clara quando especifica **o que conti
 **Imagem 09 · controles da V2 nos caminhos de execução.** Percorra o cache miss e o hit autorizado, a consulta e a reserva de agenda, o fallback de provider e o bloqueio de abuso. A prancha reúne os pontos em que autorização, orçamento e consistência precisam ser garantidos pelo backend.
 
 [![Diagrama 09: fluxos de FAQ, agenda, fallback e prevenção de Denial of Wallet, com verificações de isolamento e recuperação.][img-09]][img-09]
+
+| Fluxo obrigatório | Caminho e controle a verificar |
+| --- | --- |
+| FAQ com cache miss | Gateway → Conversation → Redis miss → Agent → `searchClinicKnowledge` → API Gateway → Knowledge → embedding com budget → pgvector filtrado → fontes → Agent → AI Gateway/Router → LLM → resposta elegível no Redis. |
+| FAQ repetida com cache hit | Gateway → Conversation → Redis hit autorizado → resposta, sem Agent/RAG/LLM; contar request e validar contexto/permissões/versão. |
+| Consulta de agenda | Agent → `getAvailableSlots` → API Gateway → Scheduling → PostgreSQL; cache curto pode orientar leitura, sem garantir reserva. |
+| Agendamento persistente | Intenção + chave → Tool → API Gateway → Scheduling → idempotência e concorrência → transação de reserva/resultado/evento → audit, invalidação e notificação recuperáveis após commit. |
+| LLM indisponível | AI Gateway → timeout/circuit breaker → fallback avaliado dentro do budget/deadline, ou degradação explícita; não repetir writes sem idempotência. |
+| Abuso/script | Gateway → rate limit/quota/concurrency/budget compartilhados → bloqueio antes da IA; Redis fora também impede operações caras. |
 
 <a id="exercicios"></a>
 
@@ -481,7 +545,8 @@ As atividades abaixo são propostas de estudo. As verificações descritas ainda
 | Simule disputa por horário | Modele duas intenções independentes concorrendo por um slot exclusivo. | [A3](#concorrencia). |
 | Interrompa uma ingestão | Escolha uma etapa para falhar e explique como retomar sem expor versão parcial. | [I3](#ingestao-versoes). |
 | Compare duas configurações de RAG | Varie chunking ou Top-K e analise recuperação, resposta, custo e latência. | [Qualidade do RAG](#qualidade-rag) e [evals](#evals). |
-| Justifique uma evolução | Escolha cache, multiagentes ou AI Gateway e apresente a medição que motivaria a mudança. | [Evolução](#evolucao). |
+| Justifique uma evolução | Escolha ampliação de cache, multiagentes ou extração do AI Gateway e apresente a medição que motivaria a mudança. | [Evolução](#evolucao). |
+| Simule Denial of Wallet | Dispute budget entre instâncias e inclua embeddings, retry/fallback e indisponibilidade do Redis. | [Custos e limites](#custos) e [fluxo 6](#fluxos-producao). |
 | Dimensione uma hipótese de carga | Declare premissas, estime concorrência e identifique limites do provider, banco e fila. | [Capacidade](#capacidade). |
 
 **Para apresentar em entrevista:** comece pelo problema e pelas premissas; percorra atendimento, conhecimento e reserva; explique as fronteiras de confiança; escolha um cenário de falha; encerre justificando o MVP e o que faria a arquitetura evoluir. Use cada componente para responder a um problema concreto.
@@ -498,6 +563,9 @@ Ao defender uma decisão, registre: **qual problema resolve, quais alternativas 
 | BFF | Backend orientado às necessidades dos clientes/canais. No desenho, compartilha a camada de entrada com o gateway. |
 | AuthN / AuthZ | Autenticação identifica o participante; autorização determina o que ele pode fazer. |
 | Agent Service | Aplicação que coordena modelo, estado, tools e limites. |
+| Conversation Service | Gerencia sessão e consulta cache autorizado antes de acionar o agente. |
+| AI Gateway / Model Router | Governa budget, credenciais e resiliência / seleciona a rota de modelo. |
+| Denial of Wallet | Abuso de operações cobradas que esgota o orçamento de consumo. |
 | Tool calling | Proposta estruturada de chamar uma capacidade, cuja execução é controlada pela aplicação. |
 | RAG | Geração apoiada por conteúdo recuperado de uma base de conhecimento. |
 | Embedding | Representação numérica usada para comparar conteúdo no espaço vetorial. |
