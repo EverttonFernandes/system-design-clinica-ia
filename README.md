@@ -4,9 +4,9 @@ Como projetar um assistente que responde dúvidas sobre uma clínica, encontra p
 
 Este repositório explora essa pergunta por meio de um **SaaS multi-tenant para clínicas**, com atendimento por Web e WhatsApp. O estudo conecta agentes, RAG, tools e backend transacional às decisões de qualidade, custo, latência e segurança que sustentam o sistema — do MVP à escala.
 
-O material nasceu de um desenho de entrevista de System Design e foi desenvolvido em **oito pranchas editáveis no draw.io**, acompanhadas de explicações, exemplos e cenários de falha. O conteúdo publicado é um estudo de arquitetura; os serviços descritos representam uma proposta, sem implementação executável ou resultados de produção neste repositório.
+O material nasceu de um desenho de entrevista de System Design e foi desenvolvido em **nove pranchas editáveis no draw.io**, acompanhadas de explicações, exemplos e cenários de falha. O conteúdo publicado é um estudo de arquitetura; os serviços descritos representam uma proposta, sem implementação executável ou resultados de produção neste repositório.
 
-**Comece pelo [fluxo de atendimento](#atendimento), acompanhe a [busca de conhecimento](#rag) e termine na [reserva de uma consulta](#agendamento).** Para editar as oito pranchas, use o [arquivo fonte do draw.io][drawio].
+**Comece pelo [fluxo de atendimento](#atendimento), acompanhe a [busca de conhecimento](#rag) e termine na [reserva de uma consulta](#agendamento).** Para editar as nove pranchas, use o [arquivo fonte do draw.io][drawio].
 
 <a id="mapa"></a>
 
@@ -24,6 +24,7 @@ Cada linha conecta uma aba do arquivo editável à imagem exportada e à sua exp
 | 06 | [Guia — Tools e agenda][img-06] | Contratos de tools e regras A1–A4 para executar ações. | [Detalhamento da agenda](#guia-agenda) |
 | 07 | [Guia — Operação e evals][img-07] | Segurança, traces, qualidade, custos, resiliência e capacidade. | [Operação do sistema](#operacao) |
 | 08 | [Guia — Evolução e falhas][img-08] | Escopo do MVP, decisões futuras e comportamento sob falhas. | [Evolução da arquitetura](#evolucao) |
+| 09 | [Fluxos críticos de produção][img-09] | Cache hit/miss, agenda, fallback e bloqueio de abuso antes da IA. | [Fluxos de produção](#fluxos-producao) |
 
 Também neste material: [contexto e requisitos](#contexto) · [exercícios de revisão](#exercicios) · [glossário](#glossario) · [como editar](#editar).
 
@@ -458,6 +459,14 @@ Use esta tabela como roteiro de análise: encontre a dependência que falhou, de
 
 Uma estratégia de recuperação fica mais clara quando especifica **o que continua disponível**, **o que o usuário recebe** e **como verificar o estado final**. “Adicionar retry” não define essas três partes.
 
+<a id="fluxos-producao"></a>
+
+### Fluxos críticos de produção
+
+**Imagem 09 · controles da V2 nos caminhos de execução.** Percorra o cache miss e o hit autorizado, a consulta e a reserva de agenda, o fallback de provider e o bloqueio de abuso. A prancha reúne os pontos em que autorização, orçamento e consistência precisam ser garantidos pelo backend.
+
+[![Diagrama 09: fluxos de FAQ, agenda, fallback e prevenção de Denial of Wallet, com verificações de isolamento e recuperação.][img-09]][img-09]
+
 <a id="exercicios"></a>
 
 ## 6. Exercícios para transformar leitura em prática
@@ -515,27 +524,28 @@ Ao defender uma decisão, registre: **qual problema resolve, quais alternativas 
 ├── draw.io/
 │   └── System Design - Clinica IA
 └── system-design/
-    └── oito imagens JPG, correspondentes às abas 01–08
+    └── nove imagens PNG, correspondentes às abas 01–09
 ```
 
-O [arquivo fonte][drawio] contém as oito abas em XML editável do draw.io, embora o nome atual esteja sem extensão. A pasta [system-design](system-design/) contém as exportações usadas neste README.
+O [arquivo fonte][drawio] contém as nove abas em XML editável do draw.io, embora o nome atual esteja sem extensão. A pasta [system-design](system-design/) contém as exportações usadas neste README.
 
 1. Abra o arquivo fonte no draw.io/diagrams.net pela opção de abrir um arquivo do dispositivo. Se necessário, selecione todos os tipos de arquivo no diálogo.
 2. Edite os componentes na aba correspondente, preservando a relação entre a visão do sistema e seu guia: **01 ↔ 04**, **02 ↔ 05**, **03 ↔ 06**.
-3. Revise também as abas **07 e 08** quando a mudança afetar operação, segurança, decisões ou cenários de falha.
-4. Exporte novamente as abas alteradas para JPG e substitua as imagens correspondentes em `system-design/`.
+3. Revise também as abas **07, 08 e 09** quando a mudança afetar operação, segurança, decisões ou cenários de falha.
+4. Exporte novamente as abas alteradas para PNG com fundo escuro e substitua as imagens correspondentes em `system-design/`.
 5. Atualize as explicações do README junto com o desenho. Se mudar o nome de uma imagem, ajuste suas referências no final deste arquivo.
 
 As imagens são estáticas: os botões desenhados nelas não funcionam como navegação do GitHub. Use o [mapa de estudo](#mapa) e os links deste README para transitar entre os assuntos.
 
-As abas 01–03 favorecem a leitura dos fluxos; as abas 04–08 preservam o detalhamento para revisão. O README acompanha as duas camadas com exemplos e critérios para discutir as decisões.
+As abas 01–03 favorecem a leitura dos fluxos; as abas 04–08 preservam o detalhamento para revisão; a aba 09 reúne os fluxos críticos de produção. O README acompanha essas visões com exemplos e critérios para discutir as decisões.
 
 [drawio]: draw.io/System%20Design%20-%20Clinica%20IA
-[img-01]: system-design/System%20Design%20-%20Clinica%20IA-01%20%C2%B7%20System%20Design%20%E2%80%94%20Atendimento.jpg
-[img-02]: system-design/System%20Design%20-%20Clinica%20IA-02%20%C2%B7%20System%20Design%20%E2%80%94%20RAG%20e%20ingest%C3%A3o.jpg
-[img-03]: system-design/System%20Design%20-%20Clinica%20IA-03%20%C2%B7%20System%20Design%20%E2%80%94%20Agendamento.jpg
-[img-04]: system-design/System%20Design%20-%20Clinica%20IA-04%20%C2%B7%20Guia%20%E2%80%94%20Atendimento.jpg
-[img-05]: system-design/System%20Design%20-%20Clinica%20IA-05%20%C2%B7%20Guia%20%E2%80%94%20RAG%20e%20ingest%C3%A3o.jpg
-[img-06]: system-design/System%20Design%20-%20Clinica%20IA-06%20%C2%B7%20Guia%20%E2%80%94%20Tools%20e%20agenda.jpg
-[img-07]: system-design/System%20Design%20-%20Clinica%20IA-07%20%C2%B7%20Guia%20%E2%80%94%20Opera%C3%A7%C3%A3o%20e%20evals.jpg
-[img-08]: system-design/System%20Design%20-%20Clinica%20IA-08%20%C2%B7%20Guia%20%E2%80%94%20Evolu%C3%A7%C3%A3o%20e%20falhas.jpg
+[img-01]: system-design/System%20Design%20-%20Clinica%20IA-01%20%C2%B7%20System%20Design%20%E2%80%94%20Atendimento.png
+[img-02]: system-design/System%20Design%20-%20Clinica%20IA-02%20%C2%B7%20System%20Design%20%E2%80%94%20RAG%20e%20ingest%C3%A3o.png
+[img-03]: system-design/System%20Design%20-%20Clinica%20IA-03%20%C2%B7%20System%20Design%20%E2%80%94%20Agendamento.png
+[img-04]: system-design/System%20Design%20-%20Clinica%20IA-04%20%C2%B7%20Guia%20%E2%80%94%20Atendimento.png
+[img-05]: system-design/System%20Design%20-%20Clinica%20IA-05%20%C2%B7%20Guia%20%E2%80%94%20RAG%20e%20ingest%C3%A3o.png
+[img-06]: system-design/System%20Design%20-%20Clinica%20IA-06%20%C2%B7%20Guia%20%E2%80%94%20Tools%20e%20agenda.png
+[img-07]: system-design/System%20Design%20-%20Clinica%20IA-07%20%C2%B7%20Guia%20%E2%80%94%20Opera%C3%A7%C3%A3o%20e%20evals.png
+[img-08]: system-design/System%20Design%20-%20Clinica%20IA-08%20%C2%B7%20Guia%20%E2%80%94%20Evolu%C3%A7%C3%A3o%20e%20falhas.png
+[img-09]: system-design/System%20Design%20-%20Clinica%20IA-09%20%C2%B7%20Fluxos%20cr%C3%ADticos%20de%20produ%C3%A7%C3%A3o.png
